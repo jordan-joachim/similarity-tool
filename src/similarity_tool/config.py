@@ -85,11 +85,28 @@ def _coerce(value, default):
     return value
 
 
+def _type_mismatch(value, default) -> bool:
+    """Return True if *value* cannot be accepted for a field with *default*."""
+    if isinstance(default, bool):
+        return not isinstance(value, bool)
+    if isinstance(default, (int, float)):
+        return isinstance(value, bool) or not isinstance(value, (int, float))
+    if isinstance(default, str):
+        return not isinstance(value, str)
+    if isinstance(default, list):
+        if not isinstance(value, list):
+            return True
+        if not default:
+            return False
+        return any(not isinstance(item, type(default[0])) for item in value)
+    return False
+
+
 def load_config(path: Path | None = None) -> Config:
     """Load settings from *path* (default ``~/.config/similarity-tool/config.json``).
 
     A missing file yields the defaults. Invalid JSON, or values of the wrong
-    type, fall back to defaults for the affected fields.
+    type, fall back to defaults for the affected fields and are logged.
     """
     path = path or config_path()
     values = _defaults()
@@ -105,8 +122,26 @@ def load_config(path: Path | None = None) -> Config:
             raw = {}
         for key in fields(Config):
             if key.name in raw:
+                if _type_mismatch(raw[key.name], values[key.name]):
+                    log.error(
+                        "Config field %r has an unsupported value %r; using default %r.",
+                        key.name, raw[key.name], values[key.name],
+                    )
                 values[key.name] = _coerce(raw[key.name], values[key.name])
     return Config(**values)
+
+
+def save_config(cfg: Config, path: Path | None = None) -> Path:
+    """Write *cfg* to *path* (default ``~/.config/similarity-tool/config.json``).
+
+    The config directory is created if missing. Returns the written path.
+    """
+    path = path or config_path()
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with path.open("w", encoding="utf-8") as handle:
+        json.dump(asdict(cfg), handle, indent=2)
+        handle.write("\n")
+    return path
 
 
 def ensure_config_file(path: Path | None = None) -> Path:

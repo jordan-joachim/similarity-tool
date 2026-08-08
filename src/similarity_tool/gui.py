@@ -25,6 +25,17 @@ log = logging.getLogger(__name__)
 APP_ID = "io.github.joachim.similaritytool"
 
 
+class _MessageHandler(logging.Handler):
+    """Collect log records into a list so they can be shown in the Log panel."""
+
+    def __init__(self, messages: list[str]) -> None:
+        super().__init__()
+        self.messages = messages
+
+    def emit(self, record: logging.LogRecord) -> None:  # noqa: D102
+        self.messages.append(self.format(record))
+
+
 class SimilarityToolApplication(Gtk.Application):
     """The Similarity Tool GTK application."""
 
@@ -38,25 +49,38 @@ class SimilarityToolApplication(Gtk.Application):
 
     def do_activate(self) -> None:  # noqa: D102
         if self.window is None:
-            self.config = self._load_settings()
+            self.config, config_messages = self._load_settings()
             self.window = MainWindow(self, self.config)
+            for message in config_messages:
+                self.window._log_message(message)
             self.window.present()
         else:
             self.window.present()
 
-    def _load_settings(self) -> Config:
-        """Load or create config, ensuring the config and cache directories exist."""
-        try:
-            ensure_config_file()
-            cfg = load_config()
-            from similarity_tool.config import create_cache_dir
+    def _load_settings(self) -> tuple[Config, list[str]]:
+        """Load or create config, ensuring the config and cache directories exist.
 
-            create_cache_dir(cfg)
+        Returns the config and any messages (e.g. malformed-config errors) that
+        should be surfaced in the Log panel.
+        """
+        messages: list[str] = []
+        try:
+            from similarity_tool import config as config_mod
+
+            handler = _MessageHandler(messages)
+            config_mod.log.addHandler(handler)
+            try:
+                ensure_config_file()
+                cfg = load_config()
+                config_mod.create_cache_dir(cfg)
+            finally:
+                config_mod.log.removeHandler(handler)
             log.info("Using config at %s", os.path.expanduser("~/.config/similarity-tool/config.json"))
-            return cfg
+            return cfg, messages
         except Exception as exc:  # noqa: BLE001 - config must never prevent launch
             log.error("Could not initialize configuration (%s); using defaults.", exc)
-            return Config()
+            messages.append(f"Error: could not initialize configuration ({exc}); using defaults.")
+            return Config(), messages
 
 
 class MainWindow(Gtk.ApplicationWindow):
