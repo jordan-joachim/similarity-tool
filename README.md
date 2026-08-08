@@ -88,6 +88,24 @@ Other runtime directories, created automatically:
 If the config file is missing, malformed, or contains values of the wrong
 type, the application logs an error and uses the defaults above.
 
+### AI refinement (optional)
+
+AI refinement is **disabled by default**. When `ai_refinement` is `true`, the
+Similarity scan runs a second stage over the hash clusters: each cluster of
+2–8 images is embedded with a small CLIP model and any pair whose cosine
+similarity falls below `ai_similarity_threshold` is split into a separate
+cluster.
+
+- The model runs **CPU-only** (float32); no CUDA/GPU is used.
+- The model is loaded on **first use** and downloaded once if not already
+  cached (the download is logged in the Log panel). Subsequent scans reuse the
+  cached model.
+- If `transformers`/`torch` are not installed, or the model cannot be loaded,
+  the scan logs an error and falls back to the hash-only clusters.
+- AI-refined clusters are marked in the UI with their minimum pairwise
+  similarity score, e.g. `Cluster 1 (4 images) [AI 0.92]`; hash-only clusters
+  are shown without the `[AI …]` marker.
+
 ## Usage
 
 1. Choose a mode (Similarity or Blur) in the toolbar.

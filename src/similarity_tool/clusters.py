@@ -108,7 +108,7 @@ def within_thresholds(
     return within
 
 
-def _connected_components(adjacency: np.ndarray) -> list[list[int]]:
+def connected_components(adjacency: np.ndarray) -> list[list[int]]:
     """Return the connected components of the graph as lists of indices."""
     n = adjacency.shape[0]
     seen = np.zeros(n, dtype=bool)
@@ -130,7 +130,7 @@ def _connected_components(adjacency: np.ndarray) -> list[list[int]]:
     return components
 
 
-def _split_component(
+def split_component(
     component: list[int], adjacency: np.ndarray, max_size: int
 ) -> list[list[int]]:
     """Split a connected component into cliques of at most *max_size* members.
@@ -204,10 +204,10 @@ def build_clusters(
     adjacency = within_thresholds(records, phash_threshold, dhash_threshold)
 
     clusters: list[Cluster] = []
-    for component in _connected_components(adjacency):
+    for component in connected_components(adjacency):
         if len(component) < 2:
             continue
-        for clique in _split_component(component, adjacency, max_size):
+        for clique in split_component(component, adjacency, max_size):
             if len(clique) < 2:
                 continue
             members = [photo_by_path.get(records[i].photo_path) for i in clique]

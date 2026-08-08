@@ -52,6 +52,11 @@ class Cluster:
     def __len__(self) -> int:
         return len(self.members)
 
+    @property
+    def is_ai_refined(self) -> bool:
+        """True when this cluster was produced by the AI refinement stage."""
+        return self.ai_score is not None
+
 
 @dataclass
 class BlurCandidate:
