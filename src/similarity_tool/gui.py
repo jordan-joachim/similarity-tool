@@ -33,8 +33,9 @@ from similarity_tool.blur import scan_blur
 from similarity_tool.clusters import build_clusters
 from similarity_tool.config import Config, ensure_config_file, load_config
 from similarity_tool.hashing import HashCache
-from similarity_tool.models import BlurCandidate, Cluster
+from similarity_tool.models import BlurCandidate, Cluster, QueueItem
 from similarity_tool.scanner import list_year_months, scan_month
+from similarity_tool.trash import TrashFailure, TrashResult, move_to_trash
 
 log = logging.getLogger(__name__)
 
@@ -200,6 +201,17 @@ class MainWindow(Gtk.ApplicationWindow):
         self._next_result_id: int = 0
         self._focused_cell_index: int = 0
 
+        # Deletion queue state. ``_queue`` holds the staged items in display
+        # order; it is the single source of truth for the queue tab. Items are
+        # keyed by absolute path so a file can never be staged twice, and the
+        # queue survives mode switches and month changes (it is only cleared
+        # by Discard Queue, Execute Queue, or a fresh application launch).
+        self._queue: list[QueueItem] = []
+        self._queue_by_path: dict[str, QueueItem] = {}
+        self._execution_thread: threading.Thread | None = None
+        self._queue_thumb_thread: threading.Thread | None = None
+        self._queue_thumb_generation: int = 0
+
         self.set_title(f"Similarity Tool {__version__}")
         self.set_default_size(1200, 800)
         # Keep all four regions usable when the window is shrunk: the toolbar,
@@ -214,6 +226,17 @@ class MainWindow(Gtk.ApplicationWindow):
         # Root vertical box: toolbar / content / status bar.
         root = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=0)
         self.set_child(root)
+
+        # Style the queue source-mode badge (Similarity / Blur).
+        provider = Gtk.CssProvider()
+        provider.load_from_data(
+            b".mode-badge { font-size: 10px; opacity: 0.8; }"
+        )
+        Gtk.StyleContext.add_provider_for_display(
+            Gdk.Display.get_default(),
+            provider,
+            Gtk.STYLE_PROVIDER_PRIORITY_APPLICATION,
+        )
 
         root.append(self._build_toolbar())
 
@@ -250,8 +273,8 @@ class MainWindow(Gtk.ApplicationWindow):
         self.notebook.set_size_request(-1, 180)
         root.append(self.notebook)
 
-        self.queue_placeholder = self._build_queue_page()
-        self.notebook.append_page(self.queue_placeholder, Gtk.Label(label="Queue"))
+        self.queue_page = self._build_queue_page()
+        self.notebook.append_page(self.queue_page, Gtk.Label(label="Queue"))
 
         self.log_view = Gtk.TextView()
         self.log_view.set_editable(False)
@@ -316,14 +339,17 @@ class MainWindow(Gtk.ApplicationWindow):
 
         self.add_to_queue_button = Gtk.Button(label="Add to Queue")
         self.add_to_queue_button.set_sensitive(False)
+        self.add_to_queue_button.connect("clicked", self._on_add_to_queue_clicked)
         toolbar.append(self.add_to_queue_button)
 
         self.execute_queue_button = Gtk.Button(label="Execute Queue")
         self.execute_queue_button.set_sensitive(False)
+        self.execute_queue_button.connect("clicked", self._on_execute_queue_clicked)
         toolbar.append(self.execute_queue_button)
 
         self.discard_queue_button = Gtk.Button(label="Discard Queue")
         self.discard_queue_button.set_sensitive(False)
+        self.discard_queue_button.connect("clicked", self._on_discard_queue_clicked)
         toolbar.append(self.discard_queue_button)
 
         return toolbar
@@ -658,7 +684,12 @@ class MainWindow(Gtk.ApplicationWindow):
             self._selection_by_result[self._current_result_id] = set(self._selection)
 
         self._current_result_id = result_id
-        self._selection = set(self._selection_by_result.get(result_id, set()))
+        # Clamp the restored selection to the populated cells: after an
+        # execution removed some members, stale indices from the previous
+        # selection must not linger in the selection set.
+        self._selection = {
+            i for i in self._selection_by_result.get(result_id, set()) if i < len(photos)
+        }
         self._focused_cell_index = 0
 
         # Invalidate any in-flight thumbnail load from a previous grid.
@@ -801,10 +832,11 @@ class MainWindow(Gtk.ApplicationWindow):
                 cell.checkbox.set_active(False)
 
     def _update_selection_buttons(self) -> None:
-        """Enable Select All / Select None according to the grid state."""
+        """Enable Select All / Select None / Add to Queue per the grid state."""
         populated = any(cell.photo is not None for cell in self._grid_cells)
         self.select_all_button.set_sensitive(populated)
         self.select_none_button.set_sensitive(populated and bool(self._selection))
+        self.add_to_queue_button.set_sensitive(populated and bool(self._selection))
 
     def _update_status(self) -> None:
         """Show the current selection count in the status bar."""
@@ -954,18 +986,359 @@ class MainWindow(Gtk.ApplicationWindow):
         return cell
 
     def _build_queue_page(self) -> Gtk.Widget:
+        """Build the Queue tab: header, thumbnail flow, and empty-state label.
+
+        The header shows the aggregate count and total staged size. The flow
+        box renders one thumbnail card per staged item (preview, filename,
+        size, source-mode badge, and a remove button). The empty-state label
+        is shown when nothing is staged.
+        """
         box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=4)
         box.set_margin_top(6)
         box.set_margin_bottom(6)
         box.set_margin_start(6)
         box.set_margin_end(6)
-        self.queue_count_label = Gtk.Label(label="Queue: 0 items (0 bytes)")
+
+        self.queue_count_label = Gtk.Label(label="Queue: 0 items (0 B)")
         self.queue_count_label.set_halign(Gtk.Align.START)
         box.append(self.queue_count_label)
-        empty_label = Gtk.Label(label="No items queued.")
-        empty_label.set_halign(Gtk.Align.START)
-        box.append(empty_label)
+
+        self.queue_flow = Gtk.FlowBox()
+        self.queue_flow.set_max_children_per_line(6)
+        self.queue_flow.set_selection_mode(Gtk.SelectionMode.NONE)
+        self.queue_flow.set_vexpand(True)
+        scroll = Gtk.ScrolledWindow()
+        scroll.set_child(self.queue_flow)
+        scroll.set_vexpand(True)
+        box.append(scroll)
+
+        self.queue_empty_label = Gtk.Label(label="No items queued.")
+        self.queue_empty_label.set_halign(Gtk.Align.START)
+        box.append(self.queue_empty_label)
         return box
+
+    def _build_queue_card(self, item: QueueItem) -> Gtk.FlowBoxChild:
+        """Build one queue thumbnail card for *item*.
+
+        The card shows a downscaled preview, the filename, the human-readable
+        file size, a source-mode badge (``Similarity`` or ``Blur``), and a
+        remove button. The card carries Python attributes used by the queue
+        logic: ``item``, ``picture``, ``name_label``, ``size_label``,
+        ``mode_label``, and ``remove_button``.
+        """
+        card = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=2)
+        card.set_hexpand(True)
+        card.set_vexpand(True)
+
+        picture = Gtk.Picture()
+        picture.set_content_fit(Gtk.ContentFit.CONTAIN)
+        picture.set_size_request(THUMB_MAX, THUMB_MAX)
+        picture.set_hexpand(True)
+        picture.set_vexpand(True)
+        card.append(picture)
+
+        name_label = Gtk.Label(label=item.photo.name)
+        name_label.set_ellipsize(Pango.EllipsizeMode.END)
+        name_label.set_max_width_chars(24)
+        name_label.set_halign(Gtk.Align.CENTER)
+        card.append(name_label)
+
+        size_label = Gtk.Label(label=_human_size(item.photo.size))
+        size_label.set_halign(Gtk.Align.CENTER)
+        card.append(size_label)
+
+        mode_label = Gtk.Label(label="Similarity" if item.mode == "similarity" else "Blur")
+        mode_label.set_halign(Gtk.Align.CENTER)
+        mode_label.add_css_class("mode-badge")
+        card.append(mode_label)
+
+        remove_button = Gtk.Button(label="Remove")
+        remove_button.set_halign(Gtk.Align.CENTER)
+        remove_button.connect("clicked", self._on_queue_remove_clicked)
+        card.append(remove_button)
+
+        flow_child = Gtk.FlowBoxChild()
+        flow_child.set_child(card)
+        flow_child.item = item  # type: ignore[attr-defined]
+        flow_child.picture = picture  # type: ignore[attr-defined]
+        flow_child.name_label = name_label  # type: ignore[attr-defined]
+        flow_child.size_label = size_label  # type: ignore[attr-defined]
+        flow_child.mode_label = mode_label  # type: ignore[attr-defined]
+        flow_child.remove_button = remove_button  # type: ignore[attr-defined]
+        return flow_child
+
+    def _on_add_to_queue_clicked(self, _button: Gtk.Button | None) -> None:
+        """Stage the currently selected grid photos in the shared queue.
+
+        Only populated cells that are selected are staged. A file already in
+        the queue is never staged twice. After staging, the grid selection is
+        cleared so the user can keep reviewing without re-offering the same
+        images.
+        """
+        added = 0
+        for index in sorted(self._selection):
+            cell = self._grid_cells[index]
+            if cell.photo is None:
+                continue
+            item = QueueItem(photo=cell.photo, mode=self.mode)
+            if str(item.photo.path) in self._queue_by_path:
+                continue
+            self._queue.append(item)
+            self._queue_by_path[str(item.photo.path)] = item
+            self.queue_flow.append(self._build_queue_card(item))
+            added += 1
+        if added:
+            self._log_message(f"Added {added} image(s) to the queue.")
+        self._clear_selection()
+        self._update_queue_ui()
+        if added:
+            self._load_queue_thumbnails()
+
+    def _load_queue_thumbnails(self) -> None:
+        """Downscale the queue previews on a background thread.
+
+        The textures are marshalled back with ``GLib.idle_add`` only when the
+        queue generation still matches, so a stale load (queue rebuilt) is
+        discarded.
+        """
+        self._queue_thumb_generation += 1
+        generation = self._queue_thumb_generation
+        photos = [item.photo for item in self._queue]
+        self._queue_thumb_thread = threading.Thread(
+            target=self._queue_thumb_worker,
+            args=(photos, generation),
+            daemon=True,
+        )
+        self._queue_thumb_thread.start()
+
+    def _queue_thumb_worker(self, photos: list, generation: int) -> None:
+        """Downscale *photos* to queue thumbnails on a background thread."""
+        textures: list[Gdk.Texture | None] = []
+        for photo in photos:
+            try:
+                textures.append(_load_thumbnail(photo.path))
+            except Exception:  # a bad image must never crash the queue
+                log.warning("Could not load queue thumbnail for %s", photo.path)
+                textures.append(None)
+        GLib.idle_add(self._apply_queue_thumbnails, textures, generation)
+
+    def _apply_queue_thumbnails(
+        self, textures: list[Gdk.Texture | None], generation: int
+    ) -> bool:
+        """Apply downscaled previews to the queue cards (main thread).
+
+        Returns ``False`` so the idle callback runs only once. A stale load
+        (the queue was rebuilt since the thumbnails were generated) is
+        discarded.
+        """
+        if generation != self._queue_thumb_generation:
+            return False
+        for flow_child, texture in zip(self._queue_flow_children(), textures):
+            flow_child.picture.set_paintable(texture)
+        return False
+
+    def _queue_flow_children(self) -> list[Gtk.FlowBoxChild]:
+        """Return the FlowBox children currently in the queue tab."""
+        rows: list[Gtk.FlowBoxChild] = []
+        child = self.queue_flow.get_first_child()
+        while child is not None:
+            rows.append(child)
+            child = child.get_next_sibling()
+        return rows
+
+    def _on_queue_remove_clicked(self, button: Gtk.Button) -> None:
+        """Remove the queue item whose card contains *button*.
+
+        Only the staged item is removed; the original archive file is never
+        touched.
+        """
+        card = button.get_parent()
+        flow_child = card.get_parent() if card is not None else None
+        item = getattr(flow_child, "item", None)
+        if item is None:
+            return
+        self._queue.remove(item)
+        self._queue_by_path.pop(str(item.photo.path), None)
+        self.queue_flow.remove(flow_child)
+        self._log_message(f"Removed {item.photo.name} from the queue.")
+        self._update_queue_ui()
+
+    def _on_discard_queue_clicked(self, _button: Gtk.Button | None) -> None:
+        """Clear the queue after confirmation (no files are moved)."""
+        if not self._queue:
+            return
+        if not self._confirm_discard_queue():
+            return
+        self._queue.clear()
+        self._queue_by_path.clear()
+        self.queue_flow.remove_all()
+        self._log_message("Queue discarded.")
+        self._update_queue_ui()
+
+    def _on_execute_queue_clicked(self, _button: Gtk.Button | None) -> None:
+        """Move every queued file to the dated trash folder after confirmation.
+
+        The move runs on a background thread so the GTK main loop stays
+        responsive; the result is marshalled back with ``GLib.idle_add``.
+        Successfully moved files are removed from the queue; files that could
+        not be moved stay staged so the user can retry.
+        """
+        if not self._queue:
+            return
+        if not self._confirm_execute_queue():
+            return
+        items = list(self._queue)
+        trash_root = self.cfg.resolved_trash_root()
+        self._log_message(f"Moving {len(items)} file(s) to trash...")
+        self._execution_thread = threading.Thread(
+            target=self._execution_worker,
+            args=(items, trash_root),
+            daemon=True,
+        )
+        self._execution_thread.start()
+
+    def _execution_worker(self, items: list[QueueItem], trash_root: Path) -> None:
+        """Move *items* to trash off the main thread and marshal the result back."""
+        try:
+            result = move_to_trash(items, trash_root)
+        except Exception as exc:  # a trash failure must never kill the app
+            log.exception("Trash execution failed")
+            result = TrashResult(
+                failures=[
+                    TrashFailure(item=item, error=f"Execution failed: {exc}")
+                    for item in items
+                ]
+            )
+        GLib.idle_add(self._finish_execution, result)
+
+    def _finish_execution(self, result: TrashResult) -> bool:
+        """Apply an execution result to the queue and view (main thread).
+
+        Successfully moved files are removed from the queue; failed files stay
+        staged. The current review grid is refreshed so moved files disappear
+        from the active Similarity/Blur view. Returns ``False`` so the idle
+        callback runs only once.
+        """
+        moved_paths = {entry.original_path for entry in result.moved}
+        if moved_paths:
+            self._queue = [item for item in self._queue if str(item.photo.path) not in moved_paths]
+            self._queue_by_path = {str(item.photo.path): item for item in self._queue}
+            self.queue_flow.remove_all()
+            for item in self._queue:
+                self.queue_flow.append(self._build_queue_card(item))
+            self._log_message(
+                f"Moved {len(result.moved)} file(s) to trash "
+                f"({self.cfg.resolved_trash_root() / 'YYYY-MM-DD'}/trash.log.json)."
+            )
+        for failure in result.failures:
+            self._log_message(f"Could not move {failure.item.photo.name}: {failure.error}")
+        if result.failures:
+            self._log_message(
+                f"{len(result.failures)} file(s) could not be moved and remain in the queue."
+            )
+        self._update_queue_ui()
+        if moved_paths:
+            self._load_queue_thumbnails()
+        self._refresh_current_result()
+        return False
+
+    def _confirm_execute_queue(self) -> bool:
+        """Ask the user to confirm moving the whole queue to trash.
+
+        Returns True when the user confirms. The dialog shows the number of
+        queued files and the total size about to be moved.
+        """
+        count = len(self._queue)
+        total = sum(item.photo.size for item in self._queue)
+        dialog = Gtk.AlertDialog(
+            message=f"Move {count} file(s) to trash?",
+            detail=(
+                f"Total size: {_human_size(total)}. "
+                "Files will be moved to the trash folder and can be restored from there."
+            ),
+        )
+        dialog.set_buttons(["Cancel", "Move to Trash"])
+        dialog.set_cancel_button(0)
+        dialog.set_default_button(1)
+        return dialog.choose(self, None, None, None) == 1
+
+    def _confirm_discard_queue(self) -> bool:
+        """Ask the user to confirm discarding the whole queue.
+
+        Returns True when the user confirms. No files are moved either way.
+        """
+        dialog = Gtk.AlertDialog(
+            message="Discard the queue?",
+            detail="The staged files will be removed from the queue. No files are moved or deleted.",
+        )
+        dialog.set_buttons(["Cancel", "Discard Queue"])
+        dialog.set_cancel_button(0)
+        dialog.set_default_button(1)
+        return dialog.choose(self, None, None, None) == 1
+
+    def _update_queue_ui(self) -> None:
+        """Refresh the queue header, empty-state label, and button sensitivity."""
+        count = len(self._queue)
+        total = sum(item.photo.size for item in self._queue)
+        self.queue_count_label.set_text(f"Queue: {count} items ({_human_size(total)})")
+        self.queue_empty_label.set_visible(count == 0)
+        self.execute_queue_button.set_sensitive(count > 0)
+        self.discard_queue_button.set_sensitive(count > 0)
+
+    def _clear_selection(self) -> None:
+        """Clear the current grid selection and update the UI."""
+        for cell in self._grid_cells:
+            if cell.photo is not None:
+                cell.checkbox.set_active(False)
+        self._selection = set()
+        self._update_selection_buttons()
+        self._update_status()
+
+    def _refresh_current_result(self) -> None:
+        """Reload the current result row so moved files disappear from the grid.
+
+        After an execution, files that were moved to trash no longer exist at
+        their original paths. Reloading the current result row rebuilds the
+        grid from the live result data; clusters or candidates whose members
+        were all moved are removed from the result list.
+        """
+        if self._current_result_id is None:
+            return
+        row = self.result_list.get_selected_row()
+        if row is None:
+            return
+        result = getattr(row, "result", None)
+        if isinstance(result, Cluster):
+            remaining = [m for m in result.members if m.path.exists()]
+            if not remaining:
+                self.result_list.remove(row)
+                self._clear_grid()
+                self._log_message("Removed an empty cluster from the result list.")
+                return
+            result.members = remaining
+            row.title = cluster_label(result, self._row_index(row) + 1)
+            label = row.get_child()
+            if isinstance(label, Gtk.Label):
+                label.set_text(row.title)
+            self._load_grid(row.result_id, remaining)
+        elif isinstance(result, BlurCandidate):
+            if not result.photo.path.exists():
+                self.result_list.remove(row)
+                self._clear_grid()
+                self._log_message("Removed an empty candidate from the result list.")
+                return
+            self._load_grid(row.result_id, [result.photo], tooltips=[f"Blur score {result.score:.1f}, {result.percentile:.0f}%"])
+
+    def _row_index(self, row: Gtk.ListBoxRow) -> int:
+        """Return the 0-based index of *row* in the result list."""
+        index = 0
+        child = self.result_list.get_first_child()
+        while child is not None:
+            if child is row:
+                return index
+            index += 1
+            child = child.get_next_sibling()
+        return 0
 
     def _add_shortcuts(self) -> None:
         def escape_cb(_widget: Gtk.Widget, _state: int) -> bool:

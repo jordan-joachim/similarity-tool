@@ -129,8 +129,19 @@ cluster.
    the left pane as clusters (Similarity) or ranked candidates (Blur); each
    result shows up to 8 images in the 2×4 grid.
 4. Check the thumbnails you want to remove and press **Add to Queue** (or `Q`).
-5. Review the staged files in the **Queue** tab, then press **Execute Queue**
-   (or `E`) and confirm. Files are moved to the trash folder, never deleted.
+   The selected images are staged in the shared deletion queue and the grid
+   selection clears. A file already in the queue is never staged twice.
+5. Review the staged files in the **Queue** tab: each item shows a thumbnail,
+   its filename, its size, and a badge with the source mode (Similarity or
+   Blur). The queue header shows the total item count and combined size.
+   Individual items can be removed with their **Remove** button. The queue
+   survives switching clusters, months, and modes.
+6. Press **Discard Queue** (or `D`) to clear the queue without moving any
+   files (a confirmation dialog is shown first).
+7. Press **Execute Queue** (or `E`) to move every queued file to the trash
+   folder. A confirmation dialog shows the number of files and the total size
+   before anything is moved. Files are moved to the trash folder, never
+   deleted; files that could not be moved stay in the queue so you can retry.
 
 Scanning a month with no images shows a "No images found in this month"
 message; a Similarity scan that finds no similar images shows "No similar
