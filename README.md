@@ -88,6 +88,20 @@ Other runtime directories, created automatically:
 If the config file is missing, malformed, or contains values of the wrong
 type, the application logs an error and uses the defaults above.
 
+### Blur detection
+
+Blur mode scores every image in the selected month with a Laplacian-variance
+sharpness metric (OpenCV): higher scores mean sharper images. Scores are cached
+in the same SQLite cache as the perceptual hashes, keyed by file path and
+mtime, so re-scanning an unchanged month reuses the cached scores and completes
+almost instantly. Scoring runs across all CPU cores.
+
+A Blur scan flags the bottom `blur_threshold_percentile`% of the month's
+images by score, plus any image whose score is below `blur_min_absolute`.
+Candidates are listed most-blurry-first. Because the thresholds are read from
+`config.json` at scan time, editing them and restarting the application changes
+the candidate set of the next Blur scan.
+
 ### AI refinement (optional)
 
 AI refinement is **disabled by default**. When `ai_refinement` is `true`, the

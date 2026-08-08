@@ -16,6 +16,7 @@ from similarity_tool.hashing import (
     default_worker_count,
     hamming_distance,
     hash_image,
+    update_blur_scores,
 )
 from similarity_tool.models import HashRecord, PhotoFile
 
@@ -139,6 +140,36 @@ class TestHashCache:
             assert got is not None
             assert got.phash == "c" * 16
             assert got.blur_score == 42.5
+        finally:
+            cache.close()
+
+    def test_update_blur_scores_preserves_hashes(self, tmp_path):
+        cache = HashCache(tmp_path / "h.sqlite3")
+        try:
+            cache.put(
+                HashRecord(
+                    photo_path="/x/a.jpg", mtime=1.0, phash="a" * 16, dhash="b" * 16,
+                    blur_score=42.5,
+                )
+            )
+            update_blur_scores(cache, [HashRecord(photo_path="/x/a.jpg", mtime=1.0, blur_score=7.5)])
+            got = cache.get("/x/a.jpg", 1.0)
+            assert got is not None
+            assert got.blur_score == 7.5
+            assert got.phash == "a" * 16
+            assert got.dhash == "b" * 16
+        finally:
+            cache.close()
+
+    def test_update_blur_scores_creates_row_for_unknown_path(self, tmp_path):
+        cache = HashCache(tmp_path / "h.sqlite3")
+        try:
+            update_blur_scores(cache, [HashRecord(photo_path="/x/new.jpg", mtime=5.0, blur_score=3.0)])
+            got = cache.get("/x/new.jpg", 5.0)
+            assert got is not None
+            assert got.blur_score == 3.0
+            assert got.phash == ""
+            assert got.dhash == ""
         finally:
             cache.close()
 

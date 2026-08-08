@@ -251,3 +251,35 @@ class HashCache:
                 )
             )
         return records
+
+
+def update_blur_scores(cache: HashCache, records: Sequence[HashRecord]) -> None:
+    """Persist blur scores into the shared hash cache.
+
+    Each *record* must carry a ``blur_score``. Existing hash values for the
+    same path are preserved (the blur feature shares the ``hashes`` table with
+    perceptual hashing), and a row is created when the path is not yet cached.
+    """
+    for record in records:
+        if record.blur_score is None:
+            continue
+        existing = cache.get(record.photo_path, record.mtime)
+        if existing is not None:
+            cache.put(
+                HashRecord(
+                    photo_path=record.photo_path,
+                    mtime=record.mtime,
+                    phash=existing.phash,
+                    dhash=existing.dhash,
+                    blur_score=record.blur_score,
+                    ai_embedding=existing.ai_embedding,
+                )
+            )
+        else:
+            cache.put(
+                HashRecord(
+                    photo_path=record.photo_path,
+                    mtime=record.mtime,
+                    blur_score=record.blur_score,
+                )
+            )
