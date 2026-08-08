@@ -2,28 +2,56 @@
 
 This module provides the application shell: a toolbar with the mode selector
 (Similarity / Blur), a left navigation/result pane, a right thumbnail grid
-area, and a bottom tabbed area with Queue and Log panels. Detection features
-are wired in by later milestones; the skeleton focuses on launching cleanly
-and rendering the layout regions.
+area, and a bottom tabbed area with Queue and Log panels. The Scan button
+starts a similarity or blur scan for the selected month on a background
+thread, shows a progress indicator, keeps the GTK main loop responsive, and
+populates the left result list and right grid when the scan finishes. Empty
+months and invalid month paths are surfaced as informative messages instead of
+starting a long no-op, and switching mode during an active scan cancels the
+in-progress work without crashing.
 """
 
 from __future__ import annotations
 
 import logging
 import os
+import threading
+from dataclasses import dataclass, field
+from pathlib import Path
 
 import gi
 
 gi.require_version("Gtk", "4.0")
-from gi.repository import Gio, Gtk  # noqa: E402
+from gi.repository import Gio, GLib, Gtk  # noqa: E402
 
-from similarity_tool import __version__  # noqa: E402
-from similarity_tool.config import Config, ensure_config_file, load_config  # noqa: E402
-from similarity_tool.scanner import list_year_months
+from similarity_tool import __version__
+from similarity_tool.ai_refinement import cluster_label, refine_clusters
+from similarity_tool.blur import scan_blur
+from similarity_tool.clusters import build_clusters
+from similarity_tool.config import Config, ensure_config_file, load_config
+from similarity_tool.hashing import HashCache
+from similarity_tool.models import BlurCandidate, Cluster
+from similarity_tool.scanner import list_year_months, scan_month
 
 log = logging.getLogger(__name__)
 
 APP_ID = "io.github.joachim.similaritytool"
+
+
+@dataclass
+class _ScanOutcome:
+    """The result of a background scan, marshalled back to the main thread.
+
+    ``mode`` is the detection mode the scan ran in, ``result`` holds the
+    clusters or blur candidates (empty when none were found), ``empty_month``
+    is True when the month contained no supported images at all, and ``error``
+    carries a failure message when the scan raised.
+    """
+
+    mode: str
+    result: list[Cluster] | list[BlurCandidate] = field(default_factory=list)
+    empty_month: bool = False
+    error: str | None = None
 
 
 class _MessageHandler(logging.Handler):
@@ -93,6 +121,14 @@ class MainWindow(Gtk.ApplicationWindow):
         self.cfg = cfg
         self.mode: str = "similarity"
 
+        # Scan state. Scans run on a background thread; ``_scanning`` is the
+        # single source of truth for whether a scan is in progress, and
+        # ``_scan_generation`` lets a mode switch or month change invalidate a
+        # scan that is still running.
+        self._scanning: bool = False
+        self._scan_thread: threading.Thread | None = None
+        self._scan_generation: int = 0
+
         self.set_title(f"Similarity Tool {__version__}")
         self.set_default_size(1200, 800)
         # Keep all four regions usable when the window is shrunk: the toolbar,
@@ -120,8 +156,11 @@ class MainWindow(Gtk.ApplicationWindow):
         root.append(content)
 
         self.nav_tree = self._build_nav_tree()
+        left_pane = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=0)
+        left_pane.append(self.nav_tree)
+        left_pane.append(self._build_result_list())
         left_scroll = Gtk.ScrolledWindow()
-        left_scroll.set_child(self.nav_tree)
+        left_scroll.set_child(left_pane)
         left_scroll.set_min_content_width(220)
         left_scroll.set_vexpand(True)
         content.set_start_child(left_scroll)
@@ -180,7 +219,16 @@ class MainWindow(Gtk.ApplicationWindow):
 
         self.scan_button = Gtk.Button(label="Scan")
         self.scan_button.set_sensitive(False)
+        self.scan_button.connect("clicked", self._on_scan_clicked)
         toolbar.append(self.scan_button)
+
+        # Progress indicator: a spinner plus a status label. The spinner is
+        # hidden until a scan starts and stops when the scan finishes.
+        self.scan_spinner = Gtk.Spinner()
+        self.scan_spinner.set_visible(False)
+        toolbar.append(self.scan_spinner)
+        self.scan_status_label = Gtk.Label(label="")
+        toolbar.append(self.scan_status_label)
 
         self.select_all_button = Gtk.Button(label="Select All")
         self.select_all_button.set_sensitive(False)
@@ -218,6 +266,33 @@ class MainWindow(Gtk.ApplicationWindow):
         self.nav_selection.connect("changed", self._on_nav_selection_changed)
         return tree
 
+    def _build_result_list(self) -> Gtk.Widget:
+        """Build the left-pane result list below the year/month tree.
+
+        The list shows one row per cluster (Similarity mode) or per blur
+        candidate (Blur mode). Selecting a row loads its images into the right
+        grid. The header doubles as the empty-state label.
+        """
+        box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=4)
+        box.set_margin_top(6)
+        box.set_margin_bottom(6)
+        box.set_margin_start(6)
+        box.set_margin_end(6)
+
+        self.result_header = Gtk.Label(label="Select a month and press Scan")
+        self.result_header.set_halign(Gtk.Align.START)
+        self.result_header.set_wrap(True)
+        box.append(self.result_header)
+
+        self.result_list = Gtk.ListBox()
+        self.result_list.set_selection_mode(Gtk.SelectionMode.SINGLE)
+        self.result_list.connect("row-selected", self._on_result_row_selected)
+        scroll = Gtk.ScrolledWindow()
+        scroll.set_child(self.result_list)
+        scroll.set_vexpand(True)
+        box.append(scroll)
+        return box
+
     def reload_year_months(self) -> None:
         """(Re)build the year/month tree from the configured photo root.
 
@@ -254,8 +329,235 @@ class MainWindow(Gtk.ApplicationWindow):
         return model.get_value(parent, 0), model.get_value(tree_iter, 0)
 
     def _on_nav_selection_changed(self, _selection: Gtk.TreeSelection) -> None:
-        """Enable Scan only when a month node is selected."""
+        """Enable Scan only when a month node is selected.
+
+        Selecting a different month also cancels any in-progress scan and
+        resets the current results so the grid never shows stale images for
+        the previously selected month.
+        """
+        if self._scanning:
+            self._cancel_scan("month changed")
         self.scan_button.set_sensitive(self.selected_month() is not None)
+        self._clear_results()
+
+    def _cancel_scan(self, reason: str) -> None:
+        """Cancel the in-progress scan and reset the UI to idle.
+
+        The running worker thread is daemon and keeps executing, but its
+        result is discarded: the generation is bumped so the worker's
+        ``_finish_scan`` callback is treated as stale.
+        """
+        self._scan_generation += 1
+        self._scanning = False
+        self._scan_thread = None
+        self.scan_spinner.stop()
+        self.scan_spinner.set_visible(False)
+        self.scan_status_label.set_text("")
+        self.scan_button.set_sensitive(self.selected_month() is not None)
+        self._log_message(f"Scan cancelled ({reason}).")
+
+    def _clear_results(self) -> None:
+        """Clear the result list, grid, and empty-state header.
+
+        Called when the month changes, when a scan starts, and when a scan is
+        cancelled. The grid cells are reset to their placeholder labels.
+        """
+        self.result_list.remove_all()
+        self.result_header.set_text("Select a month and press Scan")
+        for cell in self._grid_cells:
+            child = cell.get_first_child()
+            if isinstance(child, Gtk.Label):
+                child.set_text("")
+
+    def _on_scan_clicked(self, _button: Gtk.Button) -> None:
+        """Start a scan for the selected month, or surface an invalid path.
+
+        The month folder is validated on the main thread first: a missing or
+        empty folder is reported immediately without starting a background
+        scan. Otherwise the scan runs on a worker thread so the GTK main loop
+        stays responsive, and the result is marshalled back with
+        ``GLib.idle_add``.
+        """
+        if self._scanning:
+            return
+        selected = self.selected_month()
+        if selected is None:
+            self._log_message("No month selected; nothing to scan.")
+            return
+        year, month = selected
+        month_dir = Path(self.cfg.photo_root) / year / month
+        if not month_dir.is_dir():
+            message = f"Folder {year}/{month} does not exist; nothing to scan."
+            self._log_message(message)
+            self.result_header.set_text(message)
+            return
+
+        self._scanning = True
+        self._scan_generation += 1
+        generation = self._scan_generation
+        mode = self.mode
+        self.scan_button.set_sensitive(False)
+        self._clear_results()
+        self.scan_spinner.set_visible(True)
+        self.scan_spinner.start()
+        self.scan_status_label.set_text(f"Scanning {year}/{month} ({mode})...")
+        self._log_message(f"Scanning {year}/{month} ({mode})...")
+
+        self._scan_thread = threading.Thread(
+            target=self._scan_worker,
+            args=(year, month, mode, generation),
+            daemon=True,
+        )
+        self._scan_thread.start()
+
+    def _scan_worker(self, year: str, month: str, mode: str, generation: int) -> None:
+        """Run the scan off the main thread and marshal the result back.
+
+        The result is delivered with ``GLib.idle_add`` only when *generation*
+        still matches the current scan generation; a mode switch or month
+        change bumps the generation, so a stale scan's result is discarded
+        instead of being applied to the new UI state.
+        """
+        try:
+            if mode == "similarity":
+                outcome = self._run_similarity_scan(year, month)
+            else:
+                outcome = self._run_blur_scan(year, month)
+        except Exception as exc:  # a scan failure must never kill the app
+            log.exception("Scan failed for %s/%s", year, month)
+            outcome = _ScanOutcome(mode=mode, error=f"Scan failed: {exc}")
+        GLib.idle_add(self._finish_scan, generation, outcome)
+
+    def _run_similarity_scan(self, year: str, month: str) -> _ScanOutcome:
+        """Hash and cluster the selected month's images (Similarity mode)."""
+        photos = scan_month(
+            self.cfg.photo_root, year, month, self.cfg.file_extensions
+        )
+        if not photos:
+            return _ScanOutcome(mode="similarity", empty_month=True)
+        cache = HashCache(self.cfg.resolved_cache_path(), algorithms=self.cfg.hash_algorithms)
+        try:
+            records = cache.compute_hashes(photos)
+        finally:
+            cache.close()
+        result = build_clusters(
+            records,
+            photos,
+            phash_threshold=self.cfg.phash_threshold,
+            dhash_threshold=self.cfg.dhash_threshold,
+            hash_algorithms=self.cfg.hash_algorithms,
+        )
+        clusters = refine_clusters(result.clusters, self.cfg)
+        return _ScanOutcome(mode="similarity", result=clusters)
+
+    def _run_blur_scan(self, year: str, month: str) -> _ScanOutcome:
+        """Score the selected month's images and return blur candidates."""
+        photos = scan_month(
+            self.cfg.photo_root, year, month, self.cfg.file_extensions
+        )
+        if not photos:
+            return _ScanOutcome(mode="blur", empty_month=True)
+        result = scan_blur(photos, self.cfg)
+        return _ScanOutcome(mode="blur", result=result.candidates)
+
+    def _finish_scan(self, generation: int, outcome: _ScanOutcome) -> bool:
+        """Apply a finished scan's result to the UI (runs on the main thread).
+
+        Returns ``False`` so the idle callback runs only once. A stale result
+        (generation mismatch) is discarded. The progress indicator is always
+        stopped and the Scan button re-enabled.
+        """
+        if generation != self._scan_generation:
+            # A newer scan (or a mode switch / month change) superseded this
+            # one; the cancelling handler already reset the UI state, so this
+            # stale callback must not touch it.
+            return False
+
+        self._scanning = False
+        self._scan_thread = None
+        self.scan_spinner.stop()
+        self.scan_spinner.set_visible(False)
+        self.scan_status_label.set_text("")
+        self.scan_button.set_sensitive(self.selected_month() is not None)
+
+        if outcome.error is not None:
+            self._log_message(outcome.error)
+            self.result_header.set_text(outcome.error)
+            return False
+
+        if outcome.empty_month:
+            message = "No images found in this month"
+            self._log_message(message)
+            self.result_header.set_text(message)
+            return False
+
+        if outcome.mode == "similarity":
+            self._populate_clusters(outcome.result or [])
+        else:
+            self._populate_candidates(outcome.result or [])
+        self._log_message("Scan finished.")
+        return False
+
+    def _populate_clusters(self, clusters: list[Cluster]) -> None:
+        """Populate the result list and grid with similarity clusters."""
+        self.result_list.remove_all()
+        if not clusters:
+            self.result_header.set_text("No similar images found")
+            return
+        self.result_header.set_text(f"{len(clusters)} cluster(s) found")
+        for index, cluster in enumerate(clusters, start=1):
+            row = Gtk.ListBoxRow()
+            row.title = cluster_label(cluster, index)
+            row.result = cluster
+            label = Gtk.Label(label=row.title, xalign=0.0)
+            row.set_child(label)
+            self.result_list.append(row)
+        self.result_list.select_row(self.result_list.get_row_at_index(0))
+
+    def _populate_candidates(self, candidates: list[BlurCandidate]) -> None:
+        """Populate the result list and grid with blur candidates."""
+        self.result_list.remove_all()
+        if not candidates:
+            self.result_header.set_text("No blurry images found")
+            return
+        self.result_header.set_text(f"{len(candidates)} candidate(s) found")
+        for index, candidate in enumerate(candidates, start=1):
+            row = Gtk.ListBoxRow()
+            row.title = (
+                f"{index}. {candidate.photo.name} "
+                f"(score {candidate.score:.1f}, {candidate.percentile:.0f}%)"
+            )
+            row.result = candidate
+            label = Gtk.Label(label=row.title, xalign=0.0)
+            row.set_child(label)
+            self.result_list.append(row)
+        self.result_list.select_row(self.result_list.get_row_at_index(0))
+
+    def _on_result_row_selected(
+        self, _listbox: Gtk.ListBox, row: Gtk.ListBoxRow | None
+    ) -> None:
+        """Load the selected result's images into the right-hand grid.
+
+        The grid shows the member images of the selected cluster, or the
+        single candidate image in Blur mode. Stale thumbnails from a previous
+        selection are cleared first.
+        """
+        for cell in self._grid_cells:
+            child = cell.get_first_child()
+            if isinstance(child, Gtk.Label):
+                child.set_text("")
+        if row is None:
+            return
+        result = getattr(row, "result", None)
+        if isinstance(result, Cluster):
+            for cell, photo in zip(self._grid_cells, result.members):
+                child = cell.get_first_child()
+                if isinstance(child, Gtk.Label):
+                    child.set_text(photo.name)
+        elif isinstance(result, BlurCandidate):
+            child = self._grid_cells[0].get_first_child()
+            if isinstance(child, Gtk.Label):
+                child.set_text(result.photo.name)
 
     def _build_grid_area(self) -> Gtk.Widget:
         box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=6)
@@ -322,6 +624,11 @@ class MainWindow(Gtk.ApplicationWindow):
             self.mode = "similarity"
         elif selected == 1:
             self.mode = "blur"
+        # A mode switch cancels any in-progress scan: bump the generation so
+        # the running worker's result is discarded, and reset the UI to idle.
+        if self._scanning:
+            self._cancel_scan("mode switched")
+            self._clear_results()
         self._log_message(f"Mode switched to {self.mode}")
 
     def _log_message(self, message: str) -> None:

@@ -124,11 +124,20 @@ cluster.
 
 1. Choose a mode (Similarity or Blur) in the toolbar.
 2. Pick a year and month from the left-hand tree.
-3. Press **Scan**. Results appear in the left pane as clusters (Similarity) or
-   ranked candidates (Blur); each result shows up to 8 images in the 2×4 grid.
+3. Press **Scan**. A progress indicator appears in the toolbar and the window
+   stays responsive while the scan runs in the background. Results appear in
+   the left pane as clusters (Similarity) or ranked candidates (Blur); each
+   result shows up to 8 images in the 2×4 grid.
 4. Check the thumbnails you want to remove and press **Add to Queue** (or `Q`).
 5. Review the staged files in the **Queue** tab, then press **Execute Queue**
    (or `E`) and confirm. Files are moved to the trash folder, never deleted.
+
+Scanning a month with no images shows a "No images found in this month"
+message; a Similarity scan that finds no similar images shows "No similar
+images found", and a Blur scan with no blurry candidates shows "No blurry
+images found". If the selected month folder is missing, the message is
+surfaced immediately without starting a scan. Switching mode while a scan is
+running cancels the in-progress scan safely.
 
 ### Keyboard shortcuts
 
