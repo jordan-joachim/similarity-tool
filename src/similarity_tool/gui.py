@@ -13,6 +13,7 @@ in-progress work without crashing.
 
 from __future__ import annotations
 
+import io
 import logging
 import os
 import threading
@@ -22,7 +23,9 @@ from pathlib import Path
 import gi
 
 gi.require_version("Gtk", "4.0")
-from gi.repository import Gio, GLib, Gtk  # noqa: E402
+gi.require_version("Gdk", "4.0")
+from gi.repository import Gdk, Gio, GLib, Gtk, Pango  # noqa: E402
+from PIL import Image, ImageOps  # noqa: E402
 
 from similarity_tool import __version__
 from similarity_tool.ai_refinement import cluster_label, refine_clusters
@@ -36,6 +39,11 @@ from similarity_tool.scanner import list_year_months, scan_month
 log = logging.getLogger(__name__)
 
 APP_ID = "io.github.joachim.similaritytool"
+
+# Maximum edge of a downscaled thumbnail. The full-resolution image is never
+# loaded into the grid; previews are generated on a background thread and
+# scaled to fit this box while preserving the aspect ratio.
+THUMB_MAX = 200
 
 
 @dataclass
@@ -63,6 +71,51 @@ class _MessageHandler(logging.Handler):
 
     def emit(self, record: logging.LogRecord) -> None:  # noqa: D102
         self.messages.append(self.format(record))
+
+
+def _human_size(size: int) -> str:
+    """Format a byte count in a human-readable form (e.g. ``1.2 MB``)."""
+    value = float(size)
+    for unit in ("B", "KB", "MB", "GB"):
+        if value < 1024 or unit == "GB":
+            if unit == "B":
+                return f"{int(value)} B"
+            return f"{value:.1f} {unit}"
+        value /= 1024
+    return f"{size} B"
+
+
+def _load_thumbnail(path: Path) -> Gdk.Texture | None:
+    """Downscale *path* to a thumbnail texture, preserving the aspect ratio.
+
+    The image is decoded with Pillow, downscaled to fit ``THUMB_MAX`` on its
+    longest edge, and encoded as PNG bytes for ``Gdk.Texture``. The
+    full-resolution image is never loaded into the grid widget. Returns
+    ``None`` when the file cannot be decoded.
+    """
+    with Image.open(path) as image:
+        image = ImageOps.exif_transpose(image)
+        image.thumbnail((THUMB_MAX, THUMB_MAX), Image.Resampling.LANCZOS)
+        buffer = io.BytesIO()
+        image.save(buffer, format="PNG")
+    return Gdk.Texture.new_from_bytes(GLib.Bytes.new(buffer.getvalue()))
+
+
+def _click_hits_checkbox(cell: Gtk.Box, x: float, y: float) -> bool:
+    """Return True when a click at (*x*, *y*) in *cell* lands on its checkbox.
+
+    Clicks on the checkbox are handled by the checkbox itself; the cell's
+    click gesture must not toggle the selection again in that case.
+    """
+    checkbox = getattr(cell, "checkbox", None)
+    if checkbox is None:
+        return False
+    allocation = checkbox.get_allocation()
+    if allocation.width <= 0 or allocation.height <= 0:
+        # The widget is not realized (e.g. headless tests); fall back to
+        # treating the click as a cell click.
+        return False
+    return allocation.x <= x <= allocation.x + allocation.width and allocation.y <= y <= allocation.y + allocation.height
 
 
 class SimilarityToolApplication(Gtk.Application):
@@ -128,6 +181,24 @@ class MainWindow(Gtk.ApplicationWindow):
         self._scanning: bool = False
         self._scan_thread: threading.Thread | None = None
         self._scan_generation: int = 0
+
+        # Thumbnail state. Previews are downscaled on a background thread so
+        # the main loop stays responsive; ``_thumb_generation`` invalidates
+        # stale thumbnail loads when the grid is repopulated.
+        self._thumb_thread: threading.Thread | None = None
+        self._thumb_generation: int = 0
+
+        # Grid selection state. ``_selection`` holds the indices of the
+        # currently selected cells in the 2x4 grid, and ``_selection_by_result``
+        # remembers each result's selection so it does not leak across result
+        # rows: switching away and back restores the per-result selection.
+        # Results are keyed by a monotonic id assigned to each result-list row
+        # (never by ``id(result)``, which Python may reuse after a scan).
+        self._selection: set[int] = set()
+        self._selection_by_result: dict[int, set[int]] = {}
+        self._current_result_id: int | None = None
+        self._next_result_id: int = 0
+        self._focused_cell_index: int = 0
 
         self.set_title(f"Similarity Tool {__version__}")
         self.set_default_size(1200, 800)
@@ -232,10 +303,12 @@ class MainWindow(Gtk.ApplicationWindow):
 
         self.select_all_button = Gtk.Button(label="Select All")
         self.select_all_button.set_sensitive(False)
+        self.select_all_button.connect("clicked", self._on_select_all_clicked)
         toolbar.append(self.select_all_button)
 
         self.select_none_button = Gtk.Button(label="Select None")
         self.select_none_button.set_sensitive(False)
+        self.select_none_button.connect("clicked", self._on_select_none_clicked)
         toolbar.append(self.select_none_button)
 
         separator2 = Gtk.Separator(orientation=Gtk.Orientation.VERTICAL)
@@ -360,14 +433,11 @@ class MainWindow(Gtk.ApplicationWindow):
         """Clear the result list, grid, and empty-state header.
 
         Called when the month changes, when a scan starts, and when a scan is
-        cancelled. The grid cells are reset to their placeholder labels.
+        cancelled. The grid cells are reset to their placeholder state.
         """
         self.result_list.remove_all()
         self.result_header.set_text("Select a month and press Scan")
-        for cell in self._grid_cells:
-            child = cell.get_first_child()
-            if isinstance(child, Gtk.Label):
-                child.set_text("")
+        self._clear_grid()
 
     def _on_scan_clicked(self, _button: Gtk.Button) -> None:
         """Start a scan for the selected month, or surface an invalid path.
@@ -501,6 +571,9 @@ class MainWindow(Gtk.ApplicationWindow):
     def _populate_clusters(self, clusters: list[Cluster]) -> None:
         """Populate the result list and grid with similarity clusters."""
         self.result_list.remove_all()
+        # All previous result rows are gone, so their per-result selection
+        # state is meaningless; drop it to keep memory bounded across scans.
+        self._selection_by_result.clear()
         if not clusters:
             self.result_header.set_text("No similar images found")
             return
@@ -509,6 +582,8 @@ class MainWindow(Gtk.ApplicationWindow):
             row = Gtk.ListBoxRow()
             row.title = cluster_label(cluster, index)
             row.result = cluster
+            row.result_id = self._next_result_id
+            self._next_result_id += 1
             label = Gtk.Label(label=row.title, xalign=0.0)
             row.set_child(label)
             self.result_list.append(row)
@@ -517,6 +592,9 @@ class MainWindow(Gtk.ApplicationWindow):
     def _populate_candidates(self, candidates: list[BlurCandidate]) -> None:
         """Populate the result list and grid with blur candidates."""
         self.result_list.remove_all()
+        # All previous result rows are gone, so their per-result selection
+        # state is meaningless; drop it to keep memory bounded across scans.
+        self._selection_by_result.clear()
         if not candidates:
             self.result_header.set_text("No blurry images found")
             return
@@ -528,6 +606,8 @@ class MainWindow(Gtk.ApplicationWindow):
                 f"(score {candidate.score:.1f}, {candidate.percentile:.0f}%)"
             )
             row.result = candidate
+            row.result_id = self._next_result_id
+            self._next_result_id += 1
             label = Gtk.Label(label=row.title, xalign=0.0)
             row.set_child(label)
             self.result_list.append(row)
@@ -540,24 +620,251 @@ class MainWindow(Gtk.ApplicationWindow):
 
         The grid shows the member images of the selected cluster, or the
         single candidate image in Blur mode. Stale thumbnails from a previous
-        selection are cleared first.
+        selection are cleared first, and the per-result selection state is
+        restored so selections never leak across result rows.
         """
-        for cell in self._grid_cells:
-            child = cell.get_first_child()
-            if isinstance(child, Gtk.Label):
-                child.set_text("")
         if row is None:
+            self._clear_grid()
             return
         result = getattr(row, "result", None)
+        result_id = getattr(row, "result_id", None)
         if isinstance(result, Cluster):
-            for cell, photo in zip(self._grid_cells, result.members):
-                child = cell.get_first_child()
-                if isinstance(child, Gtk.Label):
-                    child.set_text(photo.name)
+            photos = result.members
+            tooltips = None
         elif isinstance(result, BlurCandidate):
-            child = self._grid_cells[0].get_first_child()
-            if isinstance(child, Gtk.Label):
-                child.set_text(result.photo.name)
+            photos = [result.photo]
+            tooltips = [f"Blur score {result.score:.1f}, {result.percentile:.0f}%"]
+        else:
+            self._clear_grid()
+            return
+        self._load_grid(result_id, photos, tooltips=tooltips)
+
+    def _load_grid(
+        self,
+        result_id: int | None,
+        photos: list,
+        tooltips: list[str] | None = None,
+    ) -> None:
+        """Populate the 2x4 grid with *photos* for the result *result_id*.
+
+        Each populated cell shows a downscaled preview (loaded on a background
+        thread), the filename, the human-readable file size, and a checkbox.
+        Empty cells become placeholders. The selection state for *result_id*
+        is restored from ``_selection_by_result`` so it does not leak across
+        result rows.
+        """
+        # Save the current result's selection before switching away.
+        if self._current_result_id is not None:
+            self._selection_by_result[self._current_result_id] = set(self._selection)
+
+        self._current_result_id = result_id
+        self._selection = set(self._selection_by_result.get(result_id, set()))
+        self._focused_cell_index = 0
+
+        # Invalidate any in-flight thumbnail load from a previous grid.
+        self._thumb_generation += 1
+        generation = self._thumb_generation
+
+        for index, cell in enumerate(self._grid_cells):
+            if index < len(photos):
+                photo = photos[index]
+                cell.photo = photo
+                cell.name_label.set_text(photo.name)
+                cell.size_label.set_text(_human_size(photo.size))
+                cell.checkbox.set_sensitive(True)
+                cell.checkbox.set_active(index in self._selection)
+                cell.set_tooltip_text(tooltips[index] if tooltips else None)
+                cell.set_visible(True)
+            else:
+                cell.photo = None
+                cell.name_label.set_text("")
+                cell.size_label.set_text("")
+                cell.checkbox.set_sensitive(False)
+                cell.checkbox.set_active(False)
+                cell.set_tooltip_text(None)
+                cell.set_visible(True)
+
+        self._update_selection_buttons()
+        self._update_status()
+
+        # Downscale the previews off the main thread and marshal the textures
+        # back with GLib.idle_add. A stale load (generation mismatch) is
+        # discarded.
+        self._thumb_thread = threading.Thread(
+            target=self._thumb_worker,
+            args=(photos, generation),
+            daemon=True,
+        )
+        self._thumb_thread.start()
+
+    def _thumb_worker(self, photos: list, generation: int) -> None:
+        """Downscale *photos* to thumbnails on a background thread.
+
+        Each photo is decoded with Pillow, downscaled to fit ``THUMB_MAX``
+        while preserving the aspect ratio, and encoded as PNG bytes. The
+        textures are marshalled back to the main thread with ``GLib.idle_add``
+        only when *generation* still matches the current grid generation.
+        """
+        textures: list[Gdk.Texture | None] = []
+        for photo in photos:
+            try:
+                textures.append(_load_thumbnail(photo.path))
+            except Exception:  # a bad image must never crash the grid
+                log.warning("Could not load thumbnail for %s", photo.path)
+                textures.append(None)
+        GLib.idle_add(self._apply_thumbnails, textures, generation)
+
+    def _apply_thumbnails(
+        self, textures: list[Gdk.Texture | None], generation: int
+    ) -> bool:
+        """Apply downscaled previews to the grid cells (main thread).
+
+        Returns ``False`` so the idle callback runs only once. A stale load
+        (the grid was repopulated since the thumbnails were generated) is
+        discarded.
+        """
+        if generation != self._thumb_generation:
+            return False
+        for cell, texture in zip(self._grid_cells, textures):
+            cell.picture.set_paintable(texture)
+        return False
+
+    def _clear_grid(self) -> None:
+        """Reset every grid cell to its placeholder state.
+
+        The current result's selection is saved before clearing so it can be
+        restored when the same result is selected again.
+        """
+        if self._current_result_id is not None:
+            self._selection_by_result[self._current_result_id] = set(self._selection)
+        self._current_result_id = None
+        self._selection = set()
+        self._focused_cell_index = 0
+        self._thumb_generation += 1
+        for cell in self._grid_cells:
+            cell.photo = None
+            cell.picture.set_paintable(None)
+            cell.name_label.set_text("")
+            cell.size_label.set_text("")
+            cell.checkbox.set_sensitive(False)
+            cell.checkbox.set_active(False)
+            cell.set_tooltip_text(None)
+        self._update_selection_buttons()
+        self._update_status()
+
+    def _on_cell_clicked(
+        self, _gesture: Gtk.GestureClick, _n_press: int, x: float, y: float, cell: Gtk.Box
+    ) -> None:
+        """Toggle the clicked cell's selection.
+
+        Clicks that land on the cell's checkbox are left to the checkbox
+        itself (which toggles the selection through its own handler); every
+        other click on the cell toggles the selection directly.
+        """
+        if cell.photo is None:
+            return
+        if _click_hits_checkbox(cell, x, y):
+            return
+        self._toggle_cell(self._grid_cells.index(cell))
+
+    def _on_cell_checkbox_toggled(self, checkbox: Gtk.CheckButton, cell: Gtk.Box) -> None:
+        """Keep the selection set in sync with a cell's checkbox."""
+        if cell.photo is None:
+            return
+        index = self._grid_cells.index(cell)
+        if checkbox.get_active():
+            self._selection.add(index)
+        else:
+            self._selection.discard(index)
+        self._update_selection_buttons()
+        self._update_status()
+
+    def _toggle_cell(self, index: int) -> None:
+        """Toggle the selection of the cell at *index*."""
+        if index < 0 or index >= len(self._grid_cells):
+            return
+        cell = self._grid_cells[index]
+        if cell.photo is None:
+            return
+        cell.checkbox.set_active(not cell.checkbox.get_active())
+
+    def _on_select_all_clicked(self, _button: Gtk.Button | None) -> None:
+        """Select every populated cell in the current grid."""
+        for index, cell in enumerate(self._grid_cells):
+            if cell.photo is not None:
+                cell.checkbox.set_active(True)
+
+    def _on_select_none_clicked(self, _button: Gtk.Button | None) -> None:
+        """Clear the selection in the current grid."""
+        for cell in self._grid_cells:
+            if cell.photo is not None:
+                cell.checkbox.set_active(False)
+
+    def _update_selection_buttons(self) -> None:
+        """Enable Select All / Select None according to the grid state."""
+        populated = any(cell.photo is not None for cell in self._grid_cells)
+        self.select_all_button.set_sensitive(populated)
+        self.select_none_button.set_sensitive(populated and bool(self._selection))
+
+    def _update_status(self) -> None:
+        """Show the current selection count in the status bar."""
+        self.status_label.set_text(f"{len(self._selection)} selected")
+
+    def _on_grid_key_pressed(
+        self, _controller: Gtk.EventControllerKey, keyval: int, _keycode: int, _state: int
+    ) -> bool:
+        """Handle keyboard selection shortcuts on the thumbnail grid.
+
+        ``Space`` toggles the focused cell, ``A`` selects all populated cells,
+        ``N`` clears the selection, and the arrow keys move the focus between
+        cells. Returns ``True`` when the key was handled.
+        """
+        if keyval in (Gdk.KEY_space, Gdk.KEY_Left, Gdk.KEY_Right, Gdk.KEY_Up, Gdk.KEY_Down):
+            if self._focused_cell_index >= len(self._grid_cells):
+                self._focused_cell_index = 0
+            if keyval == Gdk.KEY_space:
+                # When a cell's checkbox itself has focus, its own key binding
+                # already toggles it; the grid must not toggle a second time.
+                if self._focused_widget_is_cell_checkbox():
+                    return False
+                self._toggle_cell(self._focused_cell_index)
+            else:
+                self._move_focus(keyval)
+            return True
+        if keyval in (Gdk.KEY_a, Gdk.KEY_A):
+            self._on_select_all_clicked(None)
+            return True
+        if keyval in (Gdk.KEY_n, Gdk.KEY_N):
+            self._on_select_none_clicked(None)
+            return True
+        return False
+
+    def _focused_widget_is_cell_checkbox(self) -> bool:
+        """Return True when the focused widget is a checkbox of a grid cell."""
+        focused = self.get_focus()
+        if focused is None:
+            return False
+        for cell in self._grid_cells:
+            if focused is cell.checkbox:
+                return True
+        return False
+
+    def _move_focus(self, keyval: int) -> None:
+        """Move the focused cell in the direction of *keyval* (arrow keys)."""
+        index = self._focused_cell_index
+        row, col = divmod(index, 4)
+        if keyval == Gdk.KEY_Left:
+            col = max(0, col - 1)
+        elif keyval == Gdk.KEY_Right:
+            col = min(3, col + 1)
+        elif keyval == Gdk.KEY_Up:
+            row = max(0, row - 1)
+        elif keyval == Gdk.KEY_Down:
+            row = min(1, row + 1)
+        self._focused_cell_index = row * 4 + col
+        # Move the real GTK focus to the newly focused cell so the user can
+        # see where the keyboard selection applies.
+        self._grid_cells[self._focused_cell_index].grab_focus()
 
     def _build_grid_area(self) -> Gtk.Widget:
         box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=6)
@@ -577,23 +884,74 @@ class MainWindow(Gtk.ApplicationWindow):
         grid.set_valign(Gtk.Align.FILL)
         self.thumb_grid = grid
 
-        # 2x4 placeholder cells so the layout regions are visible at launch.
+        # 2x4 cells. Each cell shows a downscaled preview, the filename, the
+        # file size, and a checkbox. Cells are built once and reused; empty
+        # cells render as placeholders.
         self._grid_cells: list[Gtk.Box] = []
         for index in range(8):
-            cell = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=2)
-            cell.set_hexpand(True)
-            cell.set_vexpand(True)
-            placeholder = Gtk.Label(label=f"Cell {index + 1}")
-            placeholder.set_hexpand(True)
-            placeholder.set_vexpand(True)
-            placeholder.set_valign(Gtk.Align.CENTER)
-            cell.append(placeholder)
+            cell = self._build_grid_cell()
             row, col = divmod(index, 4)
             grid.attach(cell, col, row, 1, 1)
             self._grid_cells.append(cell)
 
+        # Keyboard selection: Space toggles the focused cell, A selects all,
+        # N selects none, arrows move the focus. The controller is attached to
+        # the grid so it receives keys while the grid (or a cell inside it)
+        # has focus.
+        key_controller = Gtk.EventControllerKey.new()
+        key_controller.connect("key-pressed", self._on_grid_key_pressed)
+        grid.add_controller(key_controller)
+
         box.append(grid)
         return box
+
+    def _build_grid_cell(self) -> Gtk.Box:
+        """Build one 2x4 grid cell with preview, filename, size, and checkbox.
+
+        The cell carries Python attributes used by the grid logic: ``photo``
+        (the PhotoFile shown, or ``None`` for an empty cell), ``picture``,
+        ``name_label``, ``size_label``, ``checkbox``, and ``gesture``.
+        """
+        cell = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=2)
+        cell.set_hexpand(True)
+        cell.set_vexpand(True)
+        cell.set_focusable(True)
+        cell.set_can_focus(True)
+        cell.photo = None  # type: ignore[attr-defined]
+
+        picture = Gtk.Picture()
+        picture.set_content_fit(Gtk.ContentFit.CONTAIN)
+        picture.set_size_request(THUMB_MAX, THUMB_MAX)
+        picture.set_hexpand(True)
+        picture.set_vexpand(True)
+        cell.append(picture)
+        cell.picture = picture  # type: ignore[attr-defined]
+
+        name_label = Gtk.Label(label="")
+        name_label.set_ellipsize(Pango.EllipsizeMode.END)
+        name_label.set_max_width_chars(24)
+        name_label.set_halign(Gtk.Align.CENTER)
+        cell.append(name_label)
+        cell.name_label = name_label  # type: ignore[attr-defined]
+
+        size_label = Gtk.Label(label="")
+        size_label.set_halign(Gtk.Align.CENTER)
+        cell.append(size_label)
+        cell.size_label = size_label  # type: ignore[attr-defined]
+
+        checkbox = Gtk.CheckButton()
+        checkbox.set_halign(Gtk.Align.CENTER)
+        checkbox.set_sensitive(False)
+        checkbox.connect("toggled", self._on_cell_checkbox_toggled, cell)
+        cell.append(checkbox)
+        cell.checkbox = checkbox  # type: ignore[attr-defined]
+
+        gesture = Gtk.GestureClick.new()
+        gesture.connect("pressed", self._on_cell_clicked, cell)
+        cell.add_controller(gesture)
+        cell.gesture = gesture  # type: ignore[attr-defined]
+
+        return cell
 
     def _build_queue_page(self) -> Gtk.Widget:
         box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=4)

@@ -106,13 +106,8 @@ def _result_rows(win: MainWindow) -> list[Gtk.ListBoxRow]:
 
 
 def _grid_labels(win: MainWindow) -> list[str]:
-    """Return the text of the labels currently shown in the 2x4 grid cells."""
-    labels: list[str] = []
-    for cell in win._grid_cells:
-        child = cell.get_first_child()
-        if isinstance(child, Gtk.Label):
-            labels.append(child.get_text())
-    return labels
+    """Return the text of the filename labels currently shown in the grid cells."""
+    return [cell.name_label.get_text() for cell in win._grid_cells]
 
 
 def _log_text(win: MainWindow) -> str:
