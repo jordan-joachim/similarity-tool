@@ -1,0 +1,39 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "similarity-tool"
+description = "GTK4 desktop tool for finding and trashing similar and blurry photos."
+readme = "README.md"
+requires-python = ">=3.11"
+license = { text = "MIT" }
+authors = [{ name = "Joachim Jordan" }]
+dynamic = ["version"]
+dependencies = [
+    "Pillow>=10",
+    "imagehash>=4.3",
+    "opencv-python>=4.9",
+]
+
+[project.optional-dependencies]
+ai = [
+    "transformers>=4.40",
+    "torch>=2.2",
+]
+dev = [
+    "pytest>=8",
+    "ruff>=0.5",
+]
+
+[project.scripts]
+similarity-tool = "similarity_tool.__main__:main"
+
+[tool.setuptools.dynamic]
+version = { attr = "similarity_tool.__version__" }
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
