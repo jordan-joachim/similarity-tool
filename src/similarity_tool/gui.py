@@ -19,6 +19,7 @@ from gi.repository import Gio, Gtk  # noqa: E402
 
 from similarity_tool import __version__  # noqa: E402
 from similarity_tool.config import Config, ensure_config_file, load_config  # noqa: E402
+from similarity_tool.scanner import list_year_months
 
 log = logging.getLogger(__name__)
 
@@ -94,8 +95,12 @@ class MainWindow(Gtk.ApplicationWindow):
 
         self.set_title(f"Similarity Tool {__version__}")
         self.set_default_size(1200, 800)
+        # Keep all four regions usable when the window is shrunk: the toolbar,
+        # left pane, right grid, and bottom tabs each keep a minimum size.
+        self.set_size_request(800, 600)
 
         self._build_ui()
+        self.reload_year_months()
         self._log_message(f"Similarity Tool {__version__} ready")
 
     def _build_ui(self) -> None:
@@ -108,12 +113,17 @@ class MainWindow(Gtk.ApplicationWindow):
         # Content: horizontal paned with left pane and right grid.
         content = Gtk.Paned(orientation=Gtk.Orientation.HORIZONTAL)
         content.set_wide_handle(True)
+        content.set_resize_start_child(False)
+        content.set_resize_end_child(True)
+        content.set_shrink_start_child(False)
+        content.set_shrink_end_child(False)
         root.append(content)
 
         self.nav_tree = self._build_nav_tree()
         left_scroll = Gtk.ScrolledWindow()
         left_scroll.set_child(self.nav_tree)
         left_scroll.set_min_content_width(220)
+        left_scroll.set_vexpand(True)
         content.set_start_child(left_scroll)
 
         self.grid_area = self._build_grid_area()
@@ -127,6 +137,7 @@ class MainWindow(Gtk.ApplicationWindow):
         # Bottom: tabs for Queue and Log.
         self.notebook = Gtk.Notebook()
         self.notebook.set_vexpand(False)
+        self.notebook.set_size_request(-1, 180)
         root.append(self.notebook)
 
         self.queue_placeholder = self._build_queue_page()
@@ -203,7 +214,48 @@ class MainWindow(Gtk.ApplicationWindow):
         column = Gtk.TreeViewColumn(title="Year / Month", cell_renderer=renderer, text=0)
         tree.append_column(column)
         tree.set_headers_visible(False)
+        self.nav_selection = tree.get_selection()
+        self.nav_selection.connect("changed", self._on_nav_selection_changed)
         return tree
+
+    def reload_year_months(self) -> None:
+        """(Re)build the year/month tree from the configured photo root.
+
+        Only numeric ``YYYY``/``MM`` folders are shown; non-numeric siblings
+        are ignored. The tree is empty when the root is missing or has no
+        numeric year folders.
+        """
+        self.nav_store.clear()
+        year_iters: dict[str, Gtk.TreeIter] = {}
+        for year, month in list_year_months(self.cfg.photo_root):
+            year_iter = year_iters.get(year)
+            if year_iter is None:
+                year_iter = self.nav_store.append(None, [year, "year"])
+                year_iters[year] = year_iter
+            self.nav_store.append(year_iter, [month, "month"])
+        # Expand all years so months are visible and selectable at launch;
+        # clicking a year node still collapses/expands its months.
+        self.nav_tree.expand_all()
+        self._on_nav_selection_changed(self.nav_selection)
+
+    def selected_month(self) -> tuple[str, str] | None:
+        """Return the ``(year, month)`` of the selected tree node, or ``None``.
+
+        Only a month node (a child of a year node) is a valid scan target;
+        selecting a year node returns ``None`` so the Scan button stays
+        disabled.
+        """
+        model, tree_iter = self.nav_selection.get_selected()
+        if tree_iter is None:
+            return None
+        parent = model.iter_parent(tree_iter)
+        if parent is None:
+            return None
+        return model.get_value(parent, 0), model.get_value(tree_iter, 0)
+
+    def _on_nav_selection_changed(self, _selection: Gtk.TreeSelection) -> None:
+        """Enable Scan only when a month node is selected."""
+        self.scan_button.set_sensitive(self.selected_month() is not None)
 
     def _build_grid_area(self) -> Gtk.Widget:
         box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=6)
